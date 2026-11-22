@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anamorphose Plongeon - Three.js</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; color: #fff; font-family: sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+        #hud { position: absolute; top: 10px; left: 10px; pointer-events: none; background: rgba(0,0,0,0.6); padding: 10px; border-radius: 5px; display: none; font-size: 14px; line-height: 1.4; }
+        #status { position: absolute; bottom: 10px; left: 10px; font-size: 12px; color: #aaa; }
+    </style>
+    <!-- Import Map pour Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="hud">
+        <strong>Position œil :</strong> <span id="pos"></span><br>
+        <strong>Temps :</strong> <span id="time"></span> s<br>
+        <strong>Mesure :</strong> <span id="measure"></span><br>
+        <strong>Temps musical :</strong> <span id="beat"></span>
+    </div>
+    <div id="status">Appuyez sur H (HUD), Espace (Pause), Retour arrière (Reset), G (Grille), R (Enregistrer), Flèches/Page (Déplacement)</div>
+    <canvas id="canvas"></canvas>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // ==========================================
+        // 1. CONFIGURATION
+        // ==========================================
+        const CONFIG = {
+            // Dimensions du mur (mètres)
+            WALL_WIDTH: 6.0,
+            WALL_HEIGHT: 3.4,
+            // Résolution interne du rendu
+            RENDER_WIDTH: 1920,
+            RENDER_HEIGHT: 1080,
+            // Position initiale de l'œil (spectateur)
+            EYE_POS: { x: 0, y: -1.0, z: 10.0 },
+            // Musique / Animation
+            BPM: 126,
+            MEASURES: 8, // Durée de la boucle
+            // Personnage & Scène
+            CHARACTER_SCALE: 1.0,
+            OCEAN_DEPTH: 8.0,
+            BORDER_THICKNESS: {
+                sides: 0.18, // 18%
+                topBottom: 0.20 // 20%
+            },
+            // Paramètres de rendu
+            FPS: 60,
+            BITRATE_RECORD: 40000000 // 40 Mbps
+        };
+
+        // Calculs dérivés
+        const WALL_HALF_W = CONFIG.WALL_WIDTH / 2;
+        const WALL_HALF_H = CONFIG.WALL_HEIGHT / 2;
+        const LOOP_DURATION = (CONFIG.MEASURES * 60) / CONFIG.BPM; // secondes
+        const BEAT_DURATION = 60 / CONFIG.BPM;
+
+        // État global
+        const state = {
+            eye: new THREE.Vector3(CONFIG.EYE_POS.x, CONFIG.EYE_POS.y, CONFIG.EYE_POS.z),
+            time: 0,
+            isPlaying: true,
+            showHUD: false,
+            showGrid: false,
+            isRecording: false,
+            recordingChunks: []
+        };
+
+        // ==========================================
+        // 2. SCÈNE ET RENDU
+        // ==========================================
+        const canvas = document.getElementById('canvas');
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+        renderer.setSize(CONFIG.RENDER_WIDTH, CONFIG.RENDER_HEIGHT);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.0;
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+
+        // Lumières
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(0, 10, 5);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        scene.add(dirLight);
+
+        // ==========================================
+        // 3. PROJECTION DÉCENTRÉE (OFF-AXIS)
+        // ==========================================
+        const camera = new THREE.PerspectiveCamera(45, CONFIG.RENDER_WIDTH / CONFIG.RENDER_HEIGHT, 0.1, 100);
+        
+        // Fonction pour recalculer la projection selon la position de l'œil
+        function updateProjection() {
+            const eye = state.eye;
+            const w = CONFIG.WALL_WIDTH;
+            const h = CONFIG.WALL_HEIGHT;
+            
+            // Coins du mur (z = 0)
+            const topLeft = new THREE.Vector3(-w/2, h/2, 0);
+            const topRight = new THREE.Vector3(w/2, h/2, 0);
+            const bottomLeft = new THREE.Vector3(-w/2, -h/2, 0);
+            const bottomRight = new THREE.Vector3(w/2, -h/2, 0);
+
+            // Méthode de Robert Kooima (Generalized Perspective Projection)
+            // On définit le frustum par les vecteurs vers les coins
+            const mat = new THREE.Matrix4();
+            
+            // On utilise une approche simplifiée : on calcule les vecteurs directionnels
+            // et on ajuste la matrice de projection (off-axis)
+            // Note : Three.js n'a pas de méthode native directe, on manipule la matrice
+            const left = -w/2, right = w/2, bottom = -h/2, top = h/2;
+            const near = eye.distanceTo(new THREE.Vector3(0,0,0)) * 0.9; // plan proche juste avant le mur
+            const far = 100;
+
+            // Calcul des décalages basés sur la position de l'œil
+            const dx = eye.x;
+            const dy = eye.y;
+            const dz = eye.z;
+
+            // Formule de projection décentrée (Kooima)
+            // On ajuste les plans de clipping selon le vecteur vers les coins
+            // Pour simplifier dans Three.js, on utilise la méthode de la matrice de projection personnalisée
+            const m = new THREE.Matrix4();
+            
+            // Paramètres de la pyramide de vision
+            // On calcule les facteurs de décentrage
+            const l = (-w/2 - dx) * near / dz;
+            const r = (w/2 - dx) * near / dz;
+            const b = (-h/2 - dy) * near / dz;
+            const t = (h/2 - dy) * near / dz;
+
+            // Matrice de projection off-axis
+            m.set(
+                2*near/(r-l), 0,            (r+l)/(r-l), 0,
+                0,            2*near/(t-b), (t+b)/(t-b), 0,
+                0,            0,            -(far+near)/(far-near), -2*far*near/(far-near),
+                0,            0,            -1, 0
+            );
+            
+            camera.projectionMatrix.copy(m);
+            camera.position.copy(eye);
+            camera.lookAt(0, 0, 0); // Regarde le centre du mur
+            camera.updateMatrixWorld();
+        }
+
+        // ==========================================
+        // 4. DÉCOR (CONTOUR, PUITS, OCÉAN)
+        // ==========================================
+        
+        // Contour noir (cadre)
+        const borderGroup = new THREE.Group();
+        const borderMat = new THREE.MeshStandardMaterial({ color: 0x050505, roughness: 0.9 });
+        
+        // Cadre extérieur
+        const frameGeo = new THREE.BoxGeometry(CONFIG.WALL_WIDTH, CONFIG.WALL_HEIGHT, 0.1);
+        const frame = new THREE.Mesh(frameGeo, borderMat);
+        frame.position.z = -0.05;
+        // On va créer l'ouverture en utilisant des masques ou des formes séparées
+        borderGroup.add(frame);
+
+        // Création du trou (ouverture rectangulaire)
+        const openingW = CONFIG.WALL_WIDTH * (1 - 2 * CONFIG.BORDER_THICKNESS.sides);
+        const openingH = CONFIG.WALL_HEIGHT * (1 - 2 * CONFIG.BORDER_THICKNESS.topBottom);
+        
+        // Parois du puits (4 parois)
+        const wallMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.8, metalness: 0.1 });
+        
+        const createWellWall = (w, h, d, pos, rot) => {
+            const geo = new THREE.BoxGeometry(w, h, d);
+            const mesh = new THREE.Mesh(geo, wallMat);
+            mesh.position.copy(pos);
+            mesh.rotation.copy(rot);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+            return mesh;
+        };
+
+        // Puits (profondeur 8m, z va de 0 à -8)
+        const depth = CONFIG.OCEAN_DEPTH;
+        const wallThickness = 0.1;
+        
+        // Parois (Z négatif vers le fond)
+        createWellWall(openingW, depth, wallThickness, new THREE.Vector3(0, 0, -depth/2), new THREE.Euler(0,0,0)); // Fond (simplifié)
+        createWellWall(openingW, wallThickness, depth, new THREE.Vector3(0, openingH/2 + wallThickness/2, -depth/2), new THREE.Euler(Math.PI/2, 0, 0)); // Haut
+        createWellWall(wallThickness, openingH, depth, new THREE.Vector3(-openingW/2 - wallThickness/2, 0, -depth/2), new THREE.Euler(0, Math.PI/2, 0)); // Gauche
+        createWellWall(wallThickness, openingH, depth, new THREE.Vector3(openingW/2 + wallThickness/2, 0, -depth/2), new THREE.Euler(0, -Math.PI/2, 0)); // Droite
+        
+        // Océan (Shader procédural)
+        const oceanGeo = new THREE.PlaneGeometry(openingW, openingH, 64, 64);
+        const oceanMat = new THREE.ShaderMaterial({
+            uniforms: {
+                uTime: { value: 0 },
+                uDepth: { value: depth }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                varying float vElevation;
+                uniform float uTime;
+                void main() {
+                    vUv = uv;
+                    vec3 pos = position;
+                    // Vagues simples
+                    pos.z += sin(pos.x * 5.0 + uTime * 2.0) * 0.1 + cos(pos.y * 5.0 + uTime * 1.5) * 0.1;
+                    vElevation = pos.z;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                }
+            `,
+            fragmentShader: `
+                varying vec2 vUv;
+                varying float vElevation;
+                uniform float uTime;
+                void main() {
+                    vec3 deepBlue = vec3(0.0, 0.1, 0.3);
+                    vec3 turquoise = vec3(0.0, 0.8, 0.8);
+                    vec3 color = mix(deepBlue, turquoise, vUv.y + sin(uTime) * 0.2);
+                    // Écume légère
+                    float foam = smoothstep(0.8, 1.0, sin(vUv.x * 10.0 + uTime * 3.0) * cos(vUv.y * 10.0 + uTime * 2.0));
+                    color += foam * 0.3;
+                    gl_FragColor = vec4(color, 1.0);
+                }
+            `,
+            side: THREE.DoubleSide,
+            transparent: true
+        });
+        const ocean = new THREE.Mesh(oceanGeo, oceanMat);
+        ocean.position.set(0, 0, -depth);
+        ocean.rotation.x = -Math.PI/2;
+        scene.add(ocean);
+
+        scene.add(borderGroup);
+
+        // Grille de debug
+        const gridHelper = new THREE.GridHelper(CONFIG.WALL_WIDTH, 10, 0xff0000, 0x444444);
+        gridHelper.position.z = 0.01;
+        gridHelper.visible = false;
+        scene.add(gridHelper);
+
+        // ==========================================
+        // 5. PERSONNAGE (PRIMITIVES)
+        // ==========================================
+        const characterGroup = new THREE.Group();
+        
+        // T-shirt (corps haut)
+        const bodyGeo = new THREE.CapsuleGeometry(0.2, 0.3, 4, 8);
+        const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffaa00 }); // Orange vif
+        const body = new THREE.Mesh(bodyGeo, bodyMat);
+        body.rotation.z = Math.PI/2;
+        characterGroup.add(body);
+
+        // Tête (sommet du crâne)
+        const headGeo = new THREE.SphereGeometry(0.15, 16, 16);
+        const headMat = new THREE.MeshStandardMaterial({ color: 0xffcc99 });
+        const head = new THREE.Mesh(headGeo, headMat);
+        head.position.set(0, 0.3, 0.1);
+        characterGroup.add(head);
+
+        // Cheveux (forme distincte)
+        const hairGeo = new THREE.SphereGeometry(0.16, 16, 16, 0, Math.PI*2, 0, Math.PI/2);
+        const hairMat = new THREE.MeshStandardMaterial({ color: 0x331100 });
+        const hair = new THREE.Mesh(hairGeo, hairMat);
+        hair.position.set(0, 0.35, 0.1);
+        characterGroup.add(hair);
+
+        // Nez (dépasse)
+        const noseGeo = new THREE.ConeGeometry(0.03, 0.08, 8);
+        const nose = new THREE.Mesh(noseGeo, bodyMat);
+        nose.position.set(0, 0.25, 0.2);
+        nose.rotation.x = Math.PI/2;
+        characterGroup.add(nose);
+
+        // Épaules
+        const shoulderGeo = new THREE.SphereGeometry(0.1, 8, 8, 0, Math.PI, 0, Math.PI);
+        const shoulderL = new THREE.Mesh(shoulderGeo, bodyMat);
+        shoulderL.position.set(-0.25, 0.1, 0);
+        characterGroup.add(shoulderL);
+        const shoulderR = new THREE.Mesh(shoulderGeo, bodyMat);
+        shoulderR.position.set(0.25, 0.1, 0);
+        characterGroup.add(shoulderR);
+
+        characterGroup.castShadow = true;
+        characterGroup.receiveShadow = true;
+        scene.add(characterGroup);
+
+        // ==========================================
+        // 6. ANIMATION (CALÉE SUR BPM)
+        // ==========================================
+        function updateAnimation(elapsed) {
+            // Temps déterministe (boucle parfaite)
+            const loopTime = elapsed % LOOP_DURATION;
+            const measure = Math.floor(loopTime / (BEAT_DURATION * 4)) + 1;
+            const beatInMeasure = Math.floor((loopTime % (BEAT_DURATION * 4)) / BEAT_DURATION);
+            const beatProgress = ((loopTime % (BEAT_DURATION * 4)) % BEAT_DURATION) / BEAT_DURATION;
+
+            // Mise à jour du shader océan
+            oceanMat.uniforms.uTime.value = loopTime;
+
+            // Animation personnage
+            characterGroup.visible = true;
+            
+            if (measure >= 1 && measure <= 3) {
+                // Entrée par la gauche, marche vers l'ouverture
+                const totalSteps = 12; // 3 mesures * 4 temps
+                const step = (measure - 1) * 4 + beatInMeasure;
+                const progress = step / totalSteps;
+                
+                const startX = -CONFIG.WALL_WIDTH/2 - 0.5;
+                const endX = -openingW/2 - 0.2;
+                characterGroup.position.x = startX + (endX - startX) * progress;
+                characterGroup.position.y = 0.2; // Sur le rebord
+                characterGroup.position.z = 0.5; // Vers le public
+
+                // Balancement épaules
+                const sway = Math.sin(step * Math.PI) * 0.05 * beatProgress;
+                shoulderL.position.y = 0.1 + sway;
+                shoulderR.position.y = 0.1 - sway;
+                
+                // Rotation tête
+                head.rotation.z = 0;
+                characterGroup.rotation.y = 0;
+
+            } else if (measure === 4) {
+                // Arrêt au bord, inclinaison, élan
+                characterGroup.position.x = -openingW/2 - 0.2;
+                characterGroup.position.y = 0.2;
+                characterGroup.position.z = 0.5;
+
+                if (beatInMeasure < 2) {
+                    // Regarde en bas
+                    head.rotation.z = -0.3 * beatProgress;
+                } else {
+                    // Flexion élan (temps 3 et 4)
+                    const elan = (beatInMeasure - 1) / 2;
+                    characterGroup.position.y = 0.2 - elan * 0.1;
+                    head.rotation.z = -0.3 - elan * 0.2;
+                }
+
+            } else if (measure === 5) {
+                // Saut et chute
+                const jumpProgress = (loopTime - (4 * BEAT_DURATION * 4)) / BEAT_DURATION; // début mesure 5
+                
+                if (jumpProgress < 0.5) {
+                    // Montée (z augmente vers public)
+                    const t = jumpProgress * 2;
+                    characterGroup.position.z = 0.5 + t * 0.5;
+                    characterGroup.position.y = 0.2 + Math.sin(t * Math.PI) * 0.1;
+                    characterGroup.rotation.y = t * Math.PI;
+                } else {
+                    // Chute (accélération gravitationnelle z diminue)
+                    const t = (jumpProgress - 0.5) * 2;
+                    const g = 9.8; // accélération
+                    const fallZ = 1.0 - (0.5 * g * (t * 0.5)**2); // simplifié
+                    characterGroup.position.z = Math.max(-CONFIG.OCEAN_DEPTH + 0.2, fallZ);
+                    characterGroup.position.y = 0.2 - t * 0.5;
+                    characterGroup.rotation.y = Math.PI + t * Math.PI * 2;
+                    characterGroup.scale.setScalar(Math.max(0.1, 1.0 - t * 0.5));
+                }
+
+                if (jumpProgress >= 1.0) {
+                    characterGroup.visible = false;
+                    triggerSplash();
+                }
+
+            } else {
+                // Mesures 6, 7, 8 : invisible ou calme
+                characterGroup.visible = false;
+            }
+
+            // Mise à jour HUD
+            document.getElementById('pos').innerText = `${state.eye.x.toFixed(2)}, ${state.eye.y.toFixed(2)}, ${state.eye.z.toFixed(2)}`;
+            document.getElementById('time').innerText = loopTime.toFixed(2);
+            document.getElementById('measure').innerText = measure;
+            document.getElementById('beat').innerText = `${beatInMeasure + 1}.${Math.floor(beatProgress * 100)}`;
+
+            // Mise à jour projection
+            updateProjection();
+        }
+
+        // Éclaboussure (particules simples)
+        let splashParticles = null;
+        function triggerSplash() {
+            if (splashParticles) scene.remove(splashParticles);
+            const geo = new THREE.BufferGeometry();
+            const count = 50;
+            const pos = new Float32Array(count * 3);
+            for(let i=0; i<count*3; i++) pos[i] = (Math.random()-0.5) * 0.5;
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const mat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.05 });
+            splashParticles = new THREE.Points(geo, mat);
+            splashParticles.position.set(0, 0, -CONFIG.OCEAN_DEPTH);
+            scene.add(splashParticles);
+            
+            // Disparaît après un temps
+            setTimeout(() => { if(splashParticles) scene.remove(splashParticles); }, 1000);
+        }
+
+        // ==========================================
+        // 7. CONTRÔLES ET ENREGISTREMENT
+        // ==========================================
+        window.addEventListener('keydown', (e) => {
+            const step = 0.1;
+            switch(e.key) {
+                case 'ArrowLeft': state.eye.x -= step; break;
+                case 'ArrowRight': state.eye.x += step; break;
+                case 'ArrowUp': state.eye.y += step; break;
+                case 'ArrowDown': state.eye.y -= step; break;
+                case 'PageUp': state.eye.z -= step; break;
+                case 'PageDown': state.eye.z += step; break;
+                case 'h': case 'H': 
+                    state.showHUD = !state.showHUD;
+                    document.getElementById('hud').style.display = state.showHUD ? 'block' : 'none';
+                    break;
+                case ' ': 
+                    state.isPlaying = !state.isPlaying;
+                    break;
+                case 'Backspace':
+                    state.time = 0;
+                    break;
+                case 'g': case 'G':
+                    gridHelper.visible = !gridHelper.visible;
+                    break;
+                case 'r': case 'R':
+                    startRecording();
+                    break;
+            }
+        });
+
+        // Enregistrement vidéo (MediaRecorder)
+        let mediaRecorder = null;
+        function startRecording() {
+            if (state.isRecording) return;
+            state.isRecording = true;
+            state.time = 0;
+            state.recordingChunks = [];
+            
+            const stream = canvas.captureStream(CONFIG.FPS);
+            mediaRecorder = new MediaRecorder(stream, {
+                mimeType: 'video/webm; codecs=vp9',
+                bitsPerSecond: CONFIG.BITRATE_RECORD
+            });
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) state.recordingChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(state.recordingChunks, { type: 'video/webm' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'anamorphose_plongeon.webm';
+                a.click();
+                state.isRecording = false;
+            };
+
+            mediaRecorder.start();
+            
+            // Arrêt automatique après une boucle
+            setTimeout(() => {
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+            }, LOOP_DURATION * 1000);
+        }
+
+        // ==========================================
+        // 8. BOUCLE PRINCIPALE
+        // ==========================================
+        const clock = new THREE.Clock();
+        let lastTime = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = clock.getDelta();
+            if (state.isPlaying) {
+                state.time += delta;
+            }
+
+            updateAnimation(state.time);
+            
+            // Rendu
+            renderer.render(scene, camera);
+        }
+
+        // Redimensionnement fenêtre
+        window.addEventListener('resize', () => {
+            const scale = Math.min(window.innerWidth / CONFIG.RENDER_WIDTH, window.innerHeight / CONFIG.RENDER_HEIGHT);
+            canvas.style.width = (CONFIG.RENDER_WIDTH * scale) + 'px';
+            canvas.style.height = (CONFIG.RENDER_HEIGHT * scale) + 'px';
+            renderer.setSize(CONFIG.RENDER_WIDTH, CONFIG.RENDER_HEIGHT);
+        });
+        window.dispatchEvent(new Event('resize'));
+
+        // Démarrage
+        animate();
+
+    </script>
+</body>
+</html>
